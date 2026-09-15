@@ -28,6 +28,7 @@ const mocks = vi.hoisted(() => {
       environment_id: 'env-1',
       status: 'published',
       live_generation: 1,
+      evidence_version: 7,
       kind: 'defect',
     })),
     liveIncident: vi.fn(async () => ({
@@ -103,6 +104,7 @@ describe('rolling cause coverage reconciliation', () => {
       environment_id: 'env-1',
       status: 'published',
       live_generation: 1,
+      evidence_version: 7,
       kind: 'defect',
     });
     mocks.liveIncident.mockResolvedValue({
@@ -125,14 +127,63 @@ describe('rolling cause coverage reconciliation', () => {
     mocks.enqueueTicketInvestigation.mockResolvedValue(true);
   });
 
-  it('queues a new investigation when rolling evidence no longer supports half the cause', async () => {
+  it('queues when time-window dilution drops cause coverage below half without a new evidence version', async () => {
     await scheduleFrictionReconciliation();
 
     expect(mocks.enqueueTicketInvestigation).toHaveBeenCalledTimes(1);
     expect(mocks.enqueueTicketInvestigation).toHaveBeenCalledWith(
       mocks.tx,
-      expect.objectContaining({ id: 'ticket-1', live_generation: 1 }),
+      expect.objectContaining({
+        id: 'ticket-1',
+        live_generation: 1,
+        evidence_version: 7,
+      }),
       'group-1',
     );
+  });
+
+  it('does not queue when the seven-day window is empty', async () => {
+    mocks.verifiedEvidence.mockResolvedValue({
+      users: 0,
+      sessions: 0,
+      accounts: [],
+      sessionIds: [],
+      signalIds: [],
+      representative: null,
+    });
+
+    await scheduleFrictionReconciliation();
+
+    expect(mocks.enqueueTicketInvestigation).not.toHaveBeenCalled();
+  });
+
+  it('does not queue when current evidence still has at least half cause coverage', async () => {
+    mocks.liveIncident.mockResolvedValue({
+      id: 'group-1',
+      fix_substate: 'none',
+      evidence_version_used: 7,
+      investigation_status: 'done',
+      explained_signal_ids: ['fresh-1'],
+      pr_url: null,
+    });
+
+    await scheduleFrictionReconciliation();
+
+    expect(mocks.enqueueTicketInvestigation).not.toHaveBeenCalled();
+  });
+
+  it('does not queue if a fix starts after the scheduler candidate scan', async () => {
+    mocks.liveIncident.mockResolvedValue({
+      id: 'group-1',
+      fix_substate: 'fixing',
+      evidence_version_used: 7,
+      investigation_status: 'done',
+      explained_signal_ids: ['explained-old'],
+      pr_url: 'https://github.com/acme/repo/pull/1',
+    });
+
+    await scheduleFrictionReconciliation();
+
+    expect(mocks.enqueueTicketInvestigation).not.toHaveBeenCalled();
   });
 });
