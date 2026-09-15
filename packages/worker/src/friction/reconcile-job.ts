@@ -8,18 +8,76 @@ import {
   prepareConfirmationTransition,
   confirmationSnapshotCurrent,
 } from './confirm-job.js';
+import { CAUSE_COVERAGE_MIN, causeCoverage } from './fix-attempts.js';
 import * as store from './tickets-db.js';
 
 type ReconcileJob = db.ClaimedJob & { ticketId: string };
 
+async function reconcileRollingCauseCoverage(pool: pg.Pool): Promise<void> {
+  const candidates = await pool.query<{ ticket_id: string; project_id: string }>(
+    `SELECT t.id AS ticket_id,t.project_id
+    FROM friction_tickets t
+    JOIN error_groups g ON g.ticket_id=t.id
+      AND g.publication_generation=t.live_generation
+      AND g.status<>'archived'
+    WHERE t.status='published'
+      AND g.investigation_status='done'
+      AND g.fix_substate='none'
+    ORDER BY t.id`,
+  );
+  for (const candidate of candidates.rows) {
+    const tx = await pool.connect();
+    try {
+      await tx.query('BEGIN');
+      await store.lockTicketPublication(tx, candidate.project_id, candidate.ticket_id);
+      const ticket = await store.getTicket(
+        tx,
+        candidate.project_id,
+        candidate.ticket_id,
+        true,
+      );
+      if (ticket?.status === 'published') {
+        const incident = await store.liveIncident(tx, ticket);
+        if (
+          incident?.fix_substate === 'none' &&
+          incident.investigation_status === 'done'
+        ) {
+          const recent = await store.verifiedEvidence(tx, ticket);
+          const diluted =
+            recent.signalIds.length > 0 &&
+            causeCoverage(incident.explained_signal_ids ?? [], recent.signalIds) <
+              CAUSE_COVERAGE_MIN;
+          if (
+            diluted &&
+            store.investigationAllowed(ticket, recent.users) &&
+            (await store.enqueueTicketInvestigation(tx, ticket, incident.id))
+          ) {
+            await tx.query(
+              'UPDATE friction_tickets SET reinvestigate_needed=false WHERE id=$1',
+              [ticket.id],
+            );
+          }
+        }
+      }
+      await tx.query('COMMIT');
+    } catch (error) {
+      await tx.query('ROLLBACK');
+      throw error;
+    } finally {
+      tx.release();
+    }
+  }
+}
+
 /** A durable decision retry is independent of whether another batch is selectable. */
 export async function scheduleFrictionReconciliation(): Promise<number> {
   if (store.publicationPaused()) return 0;
-  const result = await db.getPool()
-    .query(`INSERT INTO error_group_jobs(project_id,ticket_id,job_type,status)
+  const pool = db.getPool();
+  const result = await pool.query(`INSERT INTO error_group_jobs(project_id,ticket_id,job_type,status)
     SELECT project_id,id,'friction_reconcile','pending' FROM friction_tickets
     WHERE reconcile_needed AND status NOT IN ('merged','archived')
     ON CONFLICT DO NOTHING RETURNING id`);
+  await reconcileRollingCauseCoverage(pool);
   return result.rowCount ?? 0;
 }
 async function lockLease(tx: pg.PoolClient, job: ReconcileJob): Promise<void> {
